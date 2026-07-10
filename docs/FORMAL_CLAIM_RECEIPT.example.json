@@ -1,0 +1,19 @@
+{
+  "schema": "autoproof.formal-claim-receipt.v0.1",
+  "claim_id": "CGIR-CLAIM-001",
+  "session_id": "REPLACE_ME",
+  "runtime_rule_id": "REPLACE_ME",
+  "translation_version": "REPLACE_ME",
+  "lean_source_sha256": "REPLACE_ME",
+  "lean_version": "REPLACE_ME",
+  "toolchain_manifest_sha256": "PENDING",
+  "proof_status": "LEAN_VERIFIED",
+  "runtime_correspondence": "PENDING",
+  "chronicle_anchor": "PENDING",
+  "external_reproduction": "PENDING",
+  "authority": "NONE",
+  "non_claims": [
+    "The theorem does not establish runtime correspondence by itself.",
+    "The proof has not been independently reproduced unless a witness receipt is attached."
+  ]
+}
