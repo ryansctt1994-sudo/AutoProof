@@ -13,6 +13,17 @@
 - Proof-tree data API, explanation cards, and bounded natural-number counterexample search.
 - Docker development setup and a clear path to real Lean/Ollama deployments.
 
+## Proof authority
+
+AutoProof separates assistance from evidence:
+
+- AI and deterministic tactic suggestions are candidates only.
+- Demo mode is advisory and always carries `authority: NONE` and `evidence_level: E0`.
+- Only a real Lean invocation can return `LEAN_VERIFIED`.
+- A Lean-verified theorem proves its formal proposition, not automatic correspondence with an external runtime.
+
+See [`docs/CATHEDRAL_INTEGRATION.md`](docs/CATHEDRAL_INTEGRATION.md) for the Cathedral Forge integration boundary and non-claims.
+
 ## Quick start
 
 ### With Docker
@@ -44,6 +55,8 @@ Copy `.env.example` to `.env` to use an Ollama or OpenAI-compatible model. Witho
 ## Lean integration
 
 Set `LEAN_COMMAND=lean` when Lean 4 is on your path. AutoProof invokes Lean in an isolated temporary working directory and returns diagnostics. Production deployments should use a container with a pinned Lean toolchain and a dedicated project environment (Mathlib if desired).
+
+Demo mode never claims a proof has been checked. It may return `DEMO_PLAUSIBLE` for interface guidance, but `ok` and `verified` remain false.
 
 ## API overview
 
@@ -79,4 +92,3 @@ Next.js UI  ──► FastAPI orchestration ──► Lean CLI (when available)
 ## Contributing
 
 Issues and small, focused pull requests are welcome. Keep user-provided proof data private by default, add tests for backend behavior, and preserve the accessible interaction model (visible focus, text labels, no color-only state).
-
