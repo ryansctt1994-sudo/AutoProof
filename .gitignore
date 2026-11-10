@@ -8,3 +8,6 @@ data/feedback.jsonl
 .env
 .DS_Store
 
+*.tsbuildinfo
+data/
+.pytest_cache/

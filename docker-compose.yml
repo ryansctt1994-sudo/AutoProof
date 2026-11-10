@@ -6,13 +6,17 @@ services:
     volumes:
       - ./data:/app/data
     environment:
-      - DATABASE_URL=sqlite:////app/autoproof.db
+      # Lean is not installed in this image, so verification reports "not checked".
+      # Set AUTOPROOF_TRUSTED_LEAN=1 only on a machine where running Lean on submitted text is acceptable.
+      - DATABASE_PATH=/app/data/autoproof.db
+      - AUTOPROOF_TRUSTED_LEAN=0
+      - AUTOPROOF_CORS_ORIGINS=http://localhost:3000
   web:
-    build: ./frontend
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
     ports:
       - "3000:3000"
-    environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
     depends_on:
       - api
-

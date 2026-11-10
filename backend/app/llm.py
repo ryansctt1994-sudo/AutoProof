@@ -1,4 +1,6 @@
+import json
 import os
+
 import httpx
 
 
@@ -21,13 +23,16 @@ async def suggest(goal: str, context: str) -> tuple[list[dict], str]:
     model = os.getenv("LLM_MODEL")
     if not base_url or not model:
         return deterministic_suggestions(goal), "demo"
-    prompt = f"""You are a careful Lean 4 proof assistant. Given this goal and context, suggest at most five small tactics. Return strict JSON: {{\"tactics\":[{{\"tactic\":string,\"explanation\":string,\"confidence\":number}}]}}.\nGoal: {goal}\nContext: {context}"""
+    prompt = (
+        "You are a careful Lean 4 proof assistant. Given this goal and context, suggest at most five small tactics. "
+        'Return strict JSON: {"tactics":[{"tactic":string,"explanation":string,"confidence":number}]}.\n'
+        f"Goal: {goal}\nContext: {context}"
+    )
     try:
         async with httpx.AsyncClient(timeout=18) as client:
             response = await client.post(f"{base_url.rstrip('/')}/chat/completions", json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.2})
             response.raise_for_status()
             content = response.json()["choices"][0]["message"]["content"]
-            import json
             tactics = json.loads(content).get("tactics", [])
             if tactics:
                 return tactics[:5], "llm"
