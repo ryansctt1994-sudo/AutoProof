@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import store
 from .counterexample import search as search_counterexample
+from .handoff import HandoffRefused, export_candidate
 from .lean import GOAL_NAME, check_proof, lean_version, signature_text, trusted_enabled, validate_signature
 from .llm import suggest
 from .schemas import ApplyTacticRequest, CounterexampleRequest, FeedbackRequest, SessionCreate, SuggestRequest
@@ -126,6 +127,20 @@ async def feedback(payload: FeedbackRequest):
 async def proof_tree(session_id: str):
     _session_or_404(session_id)
     return store.get_tree(session_id)
+
+
+@app.get("/api/sessions/{session_id}/attempts/{attempt_id}/handoff")
+async def candidate_handoff(session_id: str, attempt_id: str):
+    """Export an identity-bound candidate, never a MathBuild acceptance receipt."""
+    session = _session_or_404(session_id)
+    tree = store.get_tree(session_id)
+    attempt = next((node for node in tree["nodes"] if node["id"] == attempt_id), None)
+    if attempt is None:
+        raise HTTPException(status_code=404, detail="Unknown proof attempt.")
+    try:
+        return export_candidate(session, attempt)
+    except HandoffRefused as error:
+        raise HTTPException(status_code=409, detail=str(error))
 
 
 @app.post("/api/counterexample")
