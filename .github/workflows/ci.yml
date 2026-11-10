@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  LEAN_VERSION: "4.35.0"
+
+jobs:
+  backend:
+    name: Backend tests (Lean required)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+      - name: Install Lean ${{ env.LEAN_VERSION }}
+        run: |
+          curl -fsSL -o lean.zip "https://releases.lean-lang.org/lean4/v${LEAN_VERSION}/lean-${LEAN_VERSION}-linux.zip"
+          unzip -q lean.zip -d "$HOME/lean"
+          echo "$HOME/lean/lean-${LEAN_VERSION}-linux/bin" >> "$GITHUB_PATH"
+      - run: pip install -r requirements-dev.txt
+      - name: Run pytest
+        env:
+          AUTOPROOF_REQUIRE_LEAN: "1"
+        run: python -m pytest -q
+
+  frontend:
+    name: Frontend lint, typecheck, build
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npx tsc --noEmit
+      - run: npm run build
+
+  browser:
+    name: Browser workflow (Playwright)
+    runs-on: ubuntu-24.04
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install Lean ${{ env.LEAN_VERSION }}
+        run: |
+          curl -fsSL -o lean.zip "https://releases.lean-lang.org/lean4/v${LEAN_VERSION}/lean-${LEAN_VERSION}-linux.zip"
+          unzip -q lean.zip -d "$HOME/lean"
+          echo "$HOME/lean/lean-${LEAN_VERSION}-linux/bin" >> "$GITHUB_PATH"
+      - run: pip install -r backend/requirements.txt
+      - run: npm ci
+        working-directory: frontend
+      - run: npx playwright install --with-deps chromium
+        working-directory: frontend
+      - name: Start API (verification on, trusted runner)
+        working-directory: backend
+        env:
+          AUTOPROOF_TRUSTED_LEAN: "1"
+          DATABASE_PATH: /tmp/autoproof-ci.db
+        run: nohup uvicorn app.main:app --port 8000 > /tmp/api.log 2>&1 &
+      - name: Build web
+        working-directory: frontend
+        run: npm run build
+      - name: Start web
+        working-directory: frontend
+        run: nohup npm run start -- -p 3000 > /tmp/web.log 2>&1 &
+      - name: Wait for both services
+        run: |
+          for url in http://localhost:8000/api/health http://localhost:3000/; do
+            for attempt in $(seq 1 60); do curl -fsS "$url" > /dev/null && break; sleep 1; done
+            curl -fsS "$url" > /dev/null
+          done
+      - name: Run browser workflow
+        working-directory: frontend
+        env:
+          AUTOPROOF_URL: http://localhost:3000
+          AUTOPROOF_EXPECT_VERIFICATION: "on"
+        run: node e2e/workflow.mjs
+      - name: Show logs on failure
+        if: failure()
+        run: cat /tmp/api.log /tmp/web.log || true
+
+  docker:
+    name: Docker images build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build API image
+        run: docker build -t autoproof-api ./backend
+      - name: Build web image
+        run: docker build -t autoproof-web ./frontend
