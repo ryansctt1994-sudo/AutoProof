@@ -9,3 +9,5 @@ data/feedback.jsonl
 .DS_Store
 
 *.tsbuildinfo
+data/
+.pytest_cache/

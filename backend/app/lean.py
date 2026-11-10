@@ -1,23 +1,34 @@
-"""Lean 4 runner.
+"""Lean 4 proof checker.
 
-Evidence rule
--------------
-A submission is ``verified`` only when the Lean compiler accepted the exact
-source *and* every named declaration in it depends on nothing beyond Lean's
-three standard axioms. Everything else is reported as what it is:
+Trust model
+-----------
+Lean runs arbitrary code while it elaborates a file (macros, elaborators,
+``#eval``, ``native_decide``). Blocking some keywords is not a sandbox, so
+verification is OFF unless the operator sets ``AUTOPROOF_TRUSTED_LEAN=1`` on a
+machine where executing the submitted text is acceptable.
 
-``verified``    Lean accepted it; the axiom audit is clean.
-``incomplete``  Lean accepted it, but it leans on ``sorry``, a declared
-                ``axiom`` or another non-standard axiom (``native_decide`` …),
-                or the axiom audit could not be completed.
-``rejected``    Lean reported errors.
-``timeout``     Lean did not finish in time.
-``unverified``  Lean is not installed. Nothing was checked.
+Proof-integrity invariant
+-------------------------
+The user never supplies a theorem name or statement. A session stores the
+statement (and binders) server-side. ``check_proof`` builds one declaration::
 
-Threat model: this catches honest mistakes and the cheap shortcuts an LLM tends
-to suggest (``sorry``, ad-hoc axioms). It is not a sandbox. Lean runs arbitrary
-code at elaboration time (``#eval``, ``run_cmd``, custom elaborators), so the
-API must not be exposed to untrusted users without OS-level isolation.
+    theorem autoproof_goal <binders> : <statement> := by
+      <user's tactic proof, indented>
+
+and asks Lean for ``#print axioms autoproof_goal``. ``verified`` is returned only
+when that declaration is present, Lean reports no errors, the proof contains no
+``sorry``, and the axioms it depends on are a subset of Lean's standard three.
+
+Statuses
+--------
+verified     the goal declaration was accepted and uses only standard axioms
+incomplete   Lean accepted the file, but it is not a complete proof (``sorry``,
+             extra axioms, or the axiom audit could not be completed)
+rejected     Lean reported an error, the target declaration is missing, or the
+             submission was refused before Lean ran
+timeout      Lean did not finish in time
+unverified   Lean is not installed, so nothing was checked
+disabled     verification is switched off on this server
 """
 from __future__ import annotations
 
@@ -34,20 +45,37 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-CHECKER_VERSION = "2"
+CHECKER_VERSION = "3"
+GOAL_NAME = "autoproof_goal"
 STANDARD_AXIOMS = frozenset({"propext", "Classical.choice", "Quot.sound"})
+MAX_PROOF_LINES = 400
+MAX_SIGNATURE_CHARS = 2_000
 
-# Commands that execute code while the file is being elaborated. Blocking them
-# is defence in depth, not a security boundary: macros can hide the same thing.
-_EVAL_COMMANDS = ("#eval", "#exit", "run_cmd", "run_elab", "run_meta", "#synth_eval")
-_DECL = re.compile(
-    r"^[ \t]*(?:@\[[^\]]*\][ \t\n]*)*(?:(?:private|protected|noncomputable|unsafe|partial|nonrec)[ \t]+)*"
-    r"(theorem|lemma|def|abbrev)[ \t]+(«[^»]+»|[^\s:({\[⦃]+)",
-    re.MULTILINE,
+# Text that could end the generated declaration early or start a new command.
+_FORBIDDEN_IN_SIGNATURE = re.compile(
+    r":=|--|/-|-/|#|[\r\n]|"
+    r"\b(?:theorem|lemma|example|def|abbrev|axiom|by|sorry|namespace|section|end|open|"
+    r"set_option|instance|macro|syntax|notation|variable|universe|initialize|unsafe|extern|implemented_by)\b"
 )
-_SCOPE = re.compile(r"^[ \t]*(namespace|section|mutual|end)\b[ \t]*([^\s]*)", re.MULTILINE)
-_AXIOM_DECL = re.compile(r"^[ \t]*(?:@\[[^\]]*\][ \t\n]*)*(?:(?:private|protected)[ \t]+)*axiom\b", re.MULTILINE)
-_AXIOM_LIST = re.compile(r"depends on axioms:\s*\[(.*?)\]", re.DOTALL)
+# Commands that execute code while the file is elaborated. Defence in depth only.
+_EXECUTION_COMMANDS = (
+    "#eval", "#exit", "run_cmd", "run_tac", "run_elab", "run_meta",
+    "initialize", "builtin_initialize", "implemented_by", "extern", "unsafe",
+)
+_BLOCKED = re.compile(r"(?<![\w.#])(?:" + "|".join(re.escape(c) for c in _EXECUTION_COMMANDS) + r")(?!\w)")
+_TRUTHY = {"1", "true", "yes", "on"}
+_AXIOM_REPORT = re.compile(
+    r"'(?P<name>[^']+)' (?:does not depend on any axioms|depends on axioms: \[(?P<list>[^\]]*)\])",
+    re.DOTALL,
+)
+_AXIOM_DECL = re.compile(r"^[ \t]*(?:@\[[^\]]*\][ \t]*)*(?:(?:private|protected)[ \t]+)*axiom\b", re.MULTILINE)
+
+
+# --- configuration -----------------------------------------------------------------
+
+def trusted_enabled() -> bool:
+    """Lean runs only on machines the operator has declared trusted."""
+    return os.getenv("AUTOPROOF_TRUSTED_LEAN", "").strip().lower() in _TRUTHY
 
 
 def _timeout() -> int:
@@ -58,7 +86,7 @@ def _timeout() -> int:
 
 
 def lean_command() -> list[str] | None:
-    """Resolve ``LEAN_COMMAND`` (which may carry arguments, e.g. ``lake env lean``)."""
+    """Resolve ``LEAN_COMMAND``, which may carry arguments such as ``lake env lean``."""
     raw = os.getenv("LEAN_COMMAND", "lean").strip()
     if not raw:
         return None
@@ -67,14 +95,19 @@ def lean_command() -> list[str] | None:
     return [executable, *parts[1:]] if executable else None
 
 
+def _project_dir() -> str | None:
+    value = os.getenv("LEAN_PROJECT_DIR", "").strip()
+    return value if value and Path(value).is_dir() else None
+
+
 @lru_cache(maxsize=8)
 def _version_of(command: tuple[str, ...]) -> str | None:
     try:
         result = subprocess.run([*command, "--version"], capture_output=True, text=True, timeout=20, cwd=_project_dir())
     except (OSError, subprocess.SubprocessError):
         return None
-    line = (result.stdout or result.stderr).strip().splitlines()
-    return line[0] if result.returncode == 0 and line else None
+    lines = (result.stdout or result.stderr).strip().splitlines()
+    return lines[0] if result.returncode == 0 and lines else None
 
 
 def lean_version() -> str | None:
@@ -82,14 +115,56 @@ def lean_version() -> str | None:
     return _version_of(tuple(command)) if command else None
 
 
-def _project_dir() -> str | None:
-    """Directory to run Lean from, so ``lake env lean`` can find a project (Mathlib …)."""
-    value = os.getenv("LEAN_PROJECT_DIR", "").strip()
-    return value if value and Path(value).is_dir() else None
+def sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def source_digest(code: str) -> str:
-    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+# --- source handling ---------------------------------------------------------------
+
+def _balanced(text: str) -> bool:
+    pairs = {")": "(", "]": "[", "}": "{", "⦄": "⦃", "⟩": "⟨"}
+    stack: list[str] = []
+    for char in text:
+        if char in "([{⦃⟨":
+            stack.append(char)
+        elif char in pairs:
+            if not stack or stack.pop() != pairs[char]:
+                return False
+    return not stack
+
+
+def validate_signature(statement: str, binders: str = "") -> None:
+    """Raise ValueError unless the statement and binders are plain Lean propositions."""
+    if not statement or not statement.strip():
+        raise ValueError("The statement is empty.")
+    if len(statement) > MAX_SIGNATURE_CHARS or len(binders) > MAX_SIGNATURE_CHARS:
+        raise ValueError("The statement or binders are too long.")
+    for label, text in (("statement", statement), ("binders", binders)):
+        match = _FORBIDDEN_IN_SIGNATURE.search(text)
+        if match:
+            raise ValueError(
+                f"The {label} may not contain {match.group(0)!r}. "
+                "Statements are Lean propositions, not commands, comments or line breaks."
+            )
+    if binders.strip() and binders.strip()[0] not in "({[⦃⟨":
+        raise ValueError("Binders must be bracketed, for example (n : Nat).")
+    if not _balanced(statement) or not _balanced(binders):
+        raise ValueError("The statement or binders have unbalanced brackets.")
+
+
+def signature_text(statement: str, binders: str = "") -> str:
+    """The declaration header the user is proving, shown read-only in the UI."""
+    head = f"theorem {GOAL_NAME}"
+    if binders.strip():
+        head += f" {binders.strip()}"
+    return f"{head} : {statement.strip()}"
+
+
+def build_source(statement: str, binders: str, proof: str) -> str:
+    validate_signature(statement, binders)
+    lines = [f"{signature_text(statement, binders)} := by"]
+    lines += ["  " + line.rstrip() if line.strip() else "" for line in proof.splitlines()]
+    return "\n".join(lines) + "\n"
 
 
 def strip_comments_and_strings(code: str) -> str:
@@ -134,70 +209,23 @@ def strip_comments_and_strings(code: str) -> str:
     return "".join(out)
 
 
-def declared_names(code: str) -> list[str]:
-    """Fully qualified names of the theorems and definitions a source declares."""
-    clean = strip_comments_and_strings(code)
-    events: list[tuple[int, str, str]] = []
-    for match in _SCOPE.finditer(clean):
-        events.append((match.start(), match.group(1), match.group(2)))
-    for match in _DECL.finditer(clean):
-        events.append((match.start(), "decl", match.group(2)))
-    events.sort()
-
-    scopes: list[str | None] = []  # namespace name, or None for a section
-    names: list[str] = []
-    for _, kind, value in events:
-        if kind == "namespace":
-            scopes.append(value or None)
-        elif kind in {"section", "mutual"}:
-            scopes.append(None)
-        elif kind == "end":
-            if scopes:
-                scopes.pop()
-        else:
-            name = value.rstrip(".")  # `foo.{u}` is cut at the brace, leaving `foo.`
-            if name.startswith("_root_."):
-                qualified = name[len("_root_.") :]
-            else:
-                qualified = ".".join([scope for scope in scopes if scope] + [name])
-            if qualified and qualified not in names:
-                names.append(qualified)
-    return names
+def _declares(clean: str, name: str) -> bool:
+    pattern = (
+        r"^[ \t]*(?:@\[[^\]\n]*\][ \t]*)?(?:(?:private|protected|noncomputable|unsafe|partial|nonrec)[ \t]+)*"
+        rf"(?:theorem|lemma)[ \t]+{re.escape(name)}(?![\w.'])"
+    )
+    return re.search(pattern, clean, re.MULTILINE) is not None
 
 
-def uses_eval(code: str) -> str | None:
-    clean = strip_comments_and_strings(code)
-    for command in _EVAL_COMMANDS:
-        if re.search(rf"(?<![\w.]){re.escape(command)}(?![\w.])", clean):
-            return command
-    return None
+def _blocked_command(clean: str) -> str | None:
+    match = _BLOCKED.search(clean)
+    return match.group(0) if match else None
 
 
-def _parse_messages(stdout: str, source_name: str) -> list[dict[str, Any]]:
-    messages: list[dict[str, Any]] = []
-    for line in stdout.splitlines():
-        if not line.strip():
-            continue
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            item = None
-        if not isinstance(item, dict) or "severity" not in item:
-            messages.append({"line": 0, "column": 0, "severity": "information", "kind": "", "message": line.replace(source_name, "main.lean")})
-            continue
-        pos = item.get("pos") or {}
-        messages.append({
-            "line": int(pos.get("line", 0) or 0),
-            "column": int(pos.get("column", 0) or 0),
-            "severity": str(item.get("severity", "information")),
-            "kind": str(item.get("kind", "") or ""),
-            "message": str(item.get("data", "")).replace(source_name, "main.lean"),
-        })
-    return messages
-
+# --- running Lean -----------------------------------------------------------------
 
 def _limit_resources() -> None:  # pragma: no cover - runs in the child process
-    os.setsid()  # own process group, so a timeout can kill Lean and anything it spawned
+    os.setsid()  # own process group, so a timeout can kill Lean and anything it spawns
     try:
         import resource
 
@@ -207,7 +235,7 @@ def _limit_resources() -> None:  # pragma: no cover - runs in the child process
 
 
 def _memory_flag() -> list[str]:
-    """Lean's own memory cap. (RLIMIT_AS is unusable: Lean reserves address space for threads.)"""
+    """Lean's own memory cap. RLIMIT_AS is unusable because Lean reserves address space for threads."""
     try:
         megabytes = int(os.getenv("LEAN_MEMORY_MB", "4096"))
     except ValueError:
@@ -218,7 +246,8 @@ def _memory_flag() -> list[str]:
 def _run(command: list[str], path: Path, workdir: str) -> tuple[int | None, str, str]:
     env = {key: value for key, value in os.environ.items() if key in {"PATH", "HOME", "LANG", "LC_ALL", "ELAN_HOME", "LEAN_PATH", "LEAN_SYSROOT", "LAKE_HOME", "TMPDIR"}}
     process = subprocess.Popen(
-        [*command, *_memory_flag(), "--json", str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+        [*command, *_memory_flag(), "--json", str(path)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
         cwd=_project_dir() or workdir, env=env, preexec_fn=_limit_resources if os.name == "posix" else None,
     )
     try:
@@ -233,78 +262,152 @@ def _run(command: list[str], path: Path, workdir: str) -> tuple[int | None, str,
         return None, "", ""
 
 
+def _parse_messages(stdout: str, source_path: str) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            item = None
+        if not isinstance(item, dict) or "severity" not in item:
+            messages.append({"line": 0, "column": 0, "severity": "information", "kind": "", "message": line.replace(source_path, "Main.lean")})
+            continue
+        pos = item.get("pos") or {}
+        messages.append({
+            "line": int(pos.get("line", 0) or 0),
+            "column": int(pos.get("column", 0) or 0),
+            "severity": str(item.get("severity", "information")),
+            "kind": str(item.get("kind", "") or ""),
+            "message": str(item.get("data", "")).replace(source_path, "Main.lean"),
+        })
+    return messages
+
+
 def _format(messages: list[dict[str, Any]]) -> str:
     return "\n".join(
         f"{m['line']}:{m['column']}: {m['severity']}: {m['message']}" if m["line"] else m["message"] for m in messages
     )
 
 
-def check_lean(code: str) -> dict[str, Any]:
-    """Check a Lean source. See the module docstring for what each status means."""
-    digest = source_digest(code)
-    base: dict[str, Any] = {"ok": False, "source_sha256": digest, "checker_version": CHECKER_VERSION, "messages": [], "axioms": {}, "lean_version": None}
-    command = lean_command()
+def _is_sorry(message: dict[str, Any]) -> bool:
+    text = message["message"]
+    return message["kind"] == "hasSorry" or "declaration uses `sorry`" in text or "declaration uses 'sorry'" in text
+
+
+def verify_source(source: str, expected_name: str = GOAL_NAME, *, command: list[str] | None = None) -> dict[str, Any]:
+    """Check a complete Lean file and audit the axioms of ``expected_name``.
+
+    This is the low-level verifier. ``check_proof`` is the entry point for user
+    submissions, because it binds the declaration to the stored statement.
+    """
+    if not source.endswith("\n"):
+        source += "\n"
+    if command is None:
+        command = lean_command()
+    base: dict[str, Any] = {
+        "ok": False, "status": "unverified", "mode": "lean", "expected": expected_name,
+        "axioms": {}, "messages": [], "lean_version": None,
+        "checker_version": CHECKER_VERSION, "source_sha256": sha256(source),
+    }
     if not command:
-        return {**base, "status": "unverified", "mode": "demo",
-                "diagnostics": "Not verified: Lean 4 is not installed, so nothing was checked. Install Lean 4 or set LEAN_COMMAND to verify this proof."}
+        return {**base, "diagnostics": "Not verified: Lean 4 is not installed, so nothing was checked. Install Lean 4 or set LEAN_COMMAND."}
     base["lean_version"] = _version_of(tuple(command))
 
-    if os.getenv("LEAN_ALLOW_EVAL", "").lower() not in {"1", "true", "yes"}:
-        blocked = uses_eval(code)
-        if blocked:
-            return {**base, "status": "rejected", "mode": "lean",
-                    "diagnostics": f"`{blocked}` runs code while Lean elaborates the file and is disabled here. Set LEAN_ALLOW_EVAL=1 on a trusted machine to allow it."}
+    clean = strip_comments_and_strings(source)
+    blocked = _blocked_command(clean)
+    if blocked:
+        return {**base, "status": "rejected", "diagnostics": f"`{blocked}` runs code during elaboration and is not allowed."}
+    if not _declares(clean, expected_name):
+        return {**base, "status": "rejected", "diagnostics": f"No theorem named `{expected_name}` is declared, so nothing was verified."}
 
-    names = declared_names(code)
-    user_lines = code.count("\n") + 1
-    audit_first_line = user_lines + 2
-    audited = code + "\n\n" + "".join(f"#print axioms {name}\n" for name in names)
-
+    audit_line = source.count("\n") + 1
+    audited = source + f"#print axioms {expected_name}\n"
     with tempfile.TemporaryDirectory(prefix="autoproof-") as workdir:
         path = Path(workdir) / "Main.lean"
         path.write_text(audited, encoding="utf-8")
         returncode, stdout, stderr = _run(command, path, workdir)
-        source_name = str(path)
+        source_path = str(path)
 
     if returncode is None:
-        return {**base, "status": "timeout", "mode": "lean", "diagnostics": f"Lean timed out after {_timeout()} seconds."}
+        return {**base, "status": "timeout", "diagnostics": f"Lean timed out after {_timeout()} seconds."}
 
-    parsed = _parse_messages(stdout, source_name)
-    messages = [m for m in parsed if m["line"] < audit_first_line]
-    audit = {m["line"]: m for m in parsed if m["line"] >= audit_first_line}
+    messages = _parse_messages(stdout, source_path)
+    base["messages"] = messages
     errors = [m for m in messages if m["severity"] == "error"]
-    result = {**base, "mode": "lean", "messages": messages}
-
-    if errors or (returncode != 0 and not audit):
-        diagnostics = _format(messages) or stderr.strip().replace(source_name, "main.lean") or f"Lean exited with status {returncode}."
-        return {**result, "status": "rejected", "diagnostics": diagnostics}
+    if errors:
+        return {**base, "status": "rejected", "diagnostics": _format(messages)}
+    if returncode != 0:
+        detail = stderr.strip().replace(source_path, "Main.lean") or f"Lean exited with status {returncode}."
+        return {**base, "status": "rejected", "diagnostics": detail}
 
     problems: list[str] = []
-    axioms: dict[str, list[str]] = {}
-    if any(m["kind"] == "hasSorry" or "declaration uses `sorry`" in m["message"] or "declaration uses 'sorry'" in m["message"] for m in messages):
+    if any(_is_sorry(m) for m in messages):
         problems.append("uses `sorry`")
-    if _AXIOM_DECL.search(strip_comments_and_strings(code)):
+    if _AXIOM_DECL.search(clean):
         problems.append("declares its own axiom")
-    for offset, name in enumerate(names):
-        report = audit.get(audit_first_line + offset)
-        if report is None or report["severity"] == "error":
-            problems.append(f"could not audit the axioms of `{name}`")
-            continue
-        listed = _AXIOM_LIST.search(report["message"])
-        if listed:
-            found = [item.strip() for item in listed.group(1).replace("\n", " ").split(",") if item.strip()]
-        elif "does not depend on any axioms" in report["message"]:
-            found = []
-        else:
-            problems.append(f"could not audit the axioms of `{name}`")
-            continue
-        axioms[name] = found
-        extra = [axiom for axiom in found if axiom not in STANDARD_AXIOMS]
-        if extra:
-            problems.append(f"`{name}` depends on non-standard axioms: {', '.join(extra)}")
 
-    result["axioms"] = axioms
+    matched = None
+    for message in messages:
+        if message["line"] != audit_line:
+            continue
+        found = _AXIOM_REPORT.match(message["message"].strip())
+        if found and found.group("name") == expected_name:
+            matched = found
+            break
+    if matched is None:
+        problems.append(f"could not complete the axiom audit for `{expected_name}`")
+        listed: list[str] = []
+    else:
+        raw = matched.group("list")
+        listed = [] if raw is None else [item.strip() for item in raw.replace("\n", " ").split(",") if item.strip()]
+        extra = [axiom for axiom in listed if axiom not in STANDARD_AXIOMS]
+        if extra:
+            problems.append(f"depends on non-standard axioms: {', '.join(extra)}")
+
+    result = {**base, "axioms": {expected_name: listed}}
     if problems:
-        summary = "Lean accepted the file, but it is not a complete proof: " + "; ".join(dict.fromkeys(problems)) + "."
+        summary = "Lean accepted the file, but it is not a complete proof: " + "; ".join(problems) + "."
         return {**result, "status": "incomplete", "diagnostics": "\n".join(filter(None, [summary, _format(messages)]))}
     return {**result, "ok": True, "status": "verified", "diagnostics": _format(messages)}
+
+
+def _refused(message: str, statement_sha: str | None = None) -> dict[str, Any]:
+    return {
+        "ok": False, "status": "rejected", "mode": "refused", "diagnostics": message,
+        "messages": [], "axioms": {}, "lean_version": None, "expected": GOAL_NAME,
+        "checker_version": CHECKER_VERSION, "source_sha256": None, "statement_sha256": statement_sha,
+    }
+
+
+def check_proof(statement: str, binders: str, proof: str) -> dict[str, Any]:
+    """Verify a user's tactic proof against the server-stored goal. This is the only entry point for submissions."""
+    statement_sha = sha256(signature_text(statement, binders)) if statement.strip() else None
+    try:
+        validate_signature(statement, binders)
+    except ValueError as error:
+        return _refused(str(error), statement_sha)
+    if not proof.strip():
+        return _refused("The proof is empty.", statement_sha)
+    if proof.count("\n") + 1 > MAX_PROOF_LINES:
+        return _refused(f"The proof is longer than {MAX_PROOF_LINES} lines.", statement_sha)
+
+    if not trusted_enabled():
+        return {
+            "ok": False, "status": "disabled", "mode": "disabled", "expected": GOAL_NAME,
+            "diagnostics": (
+                "Lean verification is turned off on this server, so this proof was not checked. "
+                "Executing Lean on submitted text is only allowed on trusted machines (AUTOPROOF_TRUSTED_LEAN=1)."
+            ),
+            "messages": [], "axioms": {}, "lean_version": None,
+            "checker_version": CHECKER_VERSION, "source_sha256": None, "statement_sha256": statement_sha,
+        }
+
+    source = build_source(statement, binders, proof)
+    result = verify_source(source, GOAL_NAME)
+    result["statement_sha256"] = statement_sha
+    result["proof_sha256"] = sha256(proof)
+    for message in result["messages"]:
+        message["proof_line"] = message["line"] - 1 if message["line"] > 1 else None
+    return result
