@@ -156,3 +156,36 @@ def test_frontend_cannot_bypass_the_goal_by_sending_a_theorem(client, session, t
         "session_id": session["id"], "tactic": "x", "proof": "exact (by decide : 2 + 2 = 5)",
     }).json()
     assert body["status"] == "rejected"
+
+
+def test_handoff_of_real_verified_attempt_is_bound_but_non_authoritative(client, session, trusted, lean_required):
+    checked = client.post("/api/apply-tactic", json={
+        "session_id": session["id"], "tactic": "simp", "proof": "simp",
+    })
+    assert checked.status_code == 200
+    result = checked.json()
+    assert result["status"] == "verified"
+    response = client.get(f"/api/sessions/{session['id']}/attempts/{result['node_id']}/handoff")
+    assert response.status_code == 200
+    handoff = response.json()
+    candidate = handoff["candidate"]
+    assert candidate["statement"] == session["statement"]
+    assert candidate["binders"] == session["binders"]
+    assert candidate["proof_text"] == "simp"
+    assert candidate["source_sha256"] == result["source_sha256"]
+    assert candidate["statement_sha256"] == result["statement_sha256"]
+    assert candidate["proof_sha256"] == result["proof_sha256"]
+    assert handoff["authority"] == "NONE"
+    assert handoff["mathbuild_acceptance"] == "NOT_EVALUATED"
+
+
+def test_handoff_refuses_disabled_and_missing_attempts(client, session):
+    result = client.post("/api/apply-tactic", json={
+        "session_id": session["id"], "tactic": "simp", "proof": "simp",
+    }).json()
+    assert result["status"] == "disabled"
+    path = f"/api/sessions/{session['id']}/attempts/{result['node_id']}/handoff"
+    response = client.get(path)
+    assert response.status_code == 409
+    assert client.get(f"/api/sessions/{session['id']}/attempts/missing/handoff").status_code == 404
+    assert client.get(f"/api/sessions/missing/attempts/{result['node_id']}/handoff").status_code == 404
